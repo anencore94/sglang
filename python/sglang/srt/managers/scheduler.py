@@ -298,6 +298,12 @@ class Scheduler(
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
+        # Wall-clock start of scheduler initialization, used to populate the
+        # sglang:engine_startup_time gauge once init completes. This measures the
+        # in-process scheduler __init__ duration (which includes model-worker
+        # creation and weight loading); it excludes process spawn and any
+        # post-init warmup such as CUDA graph capture.
+        init_start_time = time.perf_counter()
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -431,6 +437,16 @@ class Scheduler(
 
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
+
+        # Record one-shot startup timing gauges. self.stats and (when enabled)
+        # self.metrics_collector exist at this point, and the whole __init__ runs
+        # in this scheduler process, so both durations are measured here.
+        if self.enable_metrics:
+            self.stats.engine_startup_time = time.perf_counter() - init_start_time
+            model_runner = getattr(self.tp_worker, "model_runner", None)
+            self.stats.engine_load_weights_time = getattr(
+                model_runner, "weight_load_time", None
+            )
 
         self.is_initializing = False
 
