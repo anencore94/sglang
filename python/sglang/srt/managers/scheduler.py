@@ -299,7 +299,10 @@ class Scheduler(
     ):
         self.is_initializing = True
         # Wall-clock start of scheduler initialization, used to populate the
-        # sglang:engine_startup_time gauge once init completes.
+        # sglang:engine_startup_time gauge once init completes. This measures the
+        # in-process scheduler __init__ duration (which includes model-worker
+        # creation and weight loading); it excludes process spawn and any
+        # post-init warmup such as CUDA graph capture.
         init_start_time = time.perf_counter()
         self.init_soft_watchdog(server_args)
 
