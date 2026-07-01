@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import (
+    GrammarStats,
     InvalidGrammarObject,
     create_grammar_backend,
 )
@@ -56,6 +57,25 @@ class GrammarManager:
     def has_waiting_grammars(self) -> bool:
         return len(self.grammar_queue) > 0
 
+    def _log_grammar_stats(self, grammar_stats) -> None:
+        """Route a request's GrammarStats into the scheduler metrics collector.
+
+        Runs on the scheduler process (which owns the collector) and is guarded
+        by ``enable_metrics`` like the surrounding scheduler metric code. Should
+        be called exactly once per grammar (per request) to avoid double-counting.
+        Backends that do not produce stats (e.g. outlines/llguidance, or invalid
+        grammars) pass ``None`` and are skipped.
+        """
+        if grammar_stats is None:
+            return
+        scheduler = self.scheduler
+        if not getattr(scheduler, "enable_metrics", False):
+            return
+        metrics_collector = getattr(scheduler, "metrics_collector", None)
+        if metrics_collector is None:
+            return
+        metrics_collector.log_grammar_stats(grammar_stats)
+
     def abort_requests(self, recv_req: AbortReq):
         for req in self.grammar_queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
@@ -102,6 +122,11 @@ class GrammarManager:
                             f"Failed to compile {key[0]} grammar: {value.error_message}"
                         )
                         req.set_finish_with_abort(error_msg)
+                    else:
+                        # Cache hit: the copied grammar carries stats with
+                        # is_cache_hit=True. Log once here (the future/compile
+                        # path is handled in get_ready_grammar_requests).
+                        self._log_grammar_stats(getattr(value, "grammar_stats", None))
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -181,6 +206,10 @@ class GrammarManager:
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
+            else:
+                # Freshly compiled grammar (is_cache_hit=False): log its stats
+                # once as the future resolves.
+                self._log_grammar_stats(getattr(req.grammar, "grammar_stats", None))
 
         # Return failed requests
         for i in synced_failed_req_idxs:
@@ -194,6 +223,11 @@ class GrammarManager:
             )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
+            # The cancelled future never produced a grammar object, so synthesize
+            # stats for the timeout/abort so it is counted exactly once.
+            self._log_grammar_stats(
+                GrammarStats(is_grammar_aborted=True, num_timeout=1)
+            )
 
         # Remove finished requests from grammar_queue
         self.grammar_queue = [
