@@ -743,6 +743,14 @@ class SchedulerMetricsCollector:
             ),
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
         )
+        self.dp_cooperation_gpu_overlap_wait_seconds_total = Counter(
+            name="sglang:dp_cooperation_gpu_overlap_wait_seconds_total",
+            documentation=(
+                "Total time that GPU forward stream was idle waiting for "
+                "the CPU schedule stream (overlap bubble) with labels about DP cooperation."
+            ),
+            labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
+        )
 
         max_delay = server_args.prefill_delayer_max_delay_passes
         self.prefill_delayer_wait_forward_passes = Histogram(
@@ -936,6 +944,12 @@ class SchedulerMetricsCollector:
         self.gpu_overlap_wait_seconds_total.labels(
             **self.labels, category=category
         ).inc(t)
+        if dp_cooperation_info is not None:
+            self.dp_cooperation_gpu_overlap_wait_seconds_total.labels(
+                **self.labels,
+                category=category,
+                **dp_cooperation_info.to_labels(),
+            ).inc(t)
 
     def increment_gpu_execution_seconds(
         self,
