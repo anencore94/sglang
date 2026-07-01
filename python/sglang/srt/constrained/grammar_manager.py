@@ -57,14 +57,33 @@ class GrammarManager:
     def has_waiting_grammars(self) -> bool:
         return len(self.grammar_queue) > 0
 
+    @staticmethod
+    def _grammar_stats_of(grammar):
+        """Return the ``GrammarStats`` carried by a grammar object, if any.
+
+        ``ReasonerGrammarObject`` wraps the real grammar and does not carry stats
+        itself; the stats live on the inner grammar (``grammar.grammar``). Unwrap
+        one level so reasoner-wrapped backends (e.g. xgrammar behind a reasoning
+        parser) are still accounted for. Only stats-producing backends set a
+        non-``None`` value, so this never picks up an unrelated object.
+        """
+        stats = getattr(grammar, "grammar_stats", None)
+        if stats is None:
+            inner = getattr(grammar, "grammar", None)
+            if inner is not None:
+                stats = getattr(inner, "grammar_stats", None)
+        return stats
+
     def _log_grammar_stats(self, grammar_stats) -> None:
         """Route a request's GrammarStats into the scheduler metrics collector.
 
         Runs on the scheduler process (which owns the collector) and is guarded
         by ``enable_metrics`` like the surrounding scheduler metric code. Should
         be called exactly once per grammar (per request) to avoid double-counting.
-        Backends that do not produce stats (e.g. outlines/llguidance, or invalid
-        grammars) pass ``None`` and are skipped.
+        Only backends that produce a ``GrammarStats`` populate these metrics:
+        currently the xgrammar backend (including when wrapped by a reasoning
+        parser). Outlines/llguidance and invalid grammars carry no stats and are
+        skipped (``grammar_stats`` is ``None``).
         """
         if grammar_stats is None:
             return
@@ -126,7 +145,7 @@ class GrammarManager:
                         # Cache hit: the copied grammar carries stats with
                         # is_cache_hit=True. Log once here (the future/compile
                         # path is handled in get_ready_grammar_requests).
-                        self._log_grammar_stats(getattr(value, "grammar_stats", None))
+                        self._log_grammar_stats(self._grammar_stats_of(value))
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
@@ -198,6 +217,10 @@ class GrammarManager:
             req = self.grammar_queue[i]
             return_reqs.append(req)
             if req.finished() or req.grammar is None:  # It is aborted by AbortReq
+                # Intentionally not logged: the request was torn down (client
+                # abort) or finished before its grammar became ready, so it is
+                # not a completed grammar outcome. This differs from the timeout
+                # path below, which is a grammar-system failure and is counted.
                 continue
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
@@ -209,7 +232,7 @@ class GrammarManager:
             else:
                 # Freshly compiled grammar (is_cache_hit=False): log its stats
                 # once as the future resolves.
-                self._log_grammar_stats(getattr(req.grammar, "grammar_stats", None))
+                self._log_grammar_stats(self._grammar_stats_of(req.grammar))
 
         # Return failed requests
         for i in synced_failed_req_idxs:
