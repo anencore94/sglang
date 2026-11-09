@@ -44,6 +44,7 @@ from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
     QueueCount,
     SchedulerMetricsCollector,
+    SchedulerMetricsCollectorContext,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
@@ -1043,6 +1044,122 @@ class TestIdleMetrics(CustomTestCase):
                 stats.fwd_occupancy
             ),
         )
+
+    def test_priority_reporter_exports_events_once_and_resets_queue_tiers(self):
+        """Actual scheduler snapshots and rank-gated events reach the registry."""
+        for low_first in (False, True):
+            with (
+                self.subTest(low_first=low_first),
+                get_context().override_server_args(
+                    enable_metrics=True,
+                    enable_priority_scheduling=True,
+                    schedule_low_priority_values_first=low_first,
+                ) as server_args,
+            ):
+                registry = prometheus_client.CollectorRegistry()
+                base_labels = {"model_name": "test", "moe_ep_rank": "1"}
+                labels = {**base_labels, "priority": ""}
+                with patch.multiple(
+                    prometheus_client,
+                    **{
+                        name: partial(
+                            getattr(prometheus_client, name), registry=registry
+                        )
+                        for name in ("Counter", "Gauge", "Histogram", "Summary")
+                    },
+                ):
+                    collector = SchedulerMetricsCollector(labels, server_args)
+                self.scheduler.device = "cpu"
+                waiting = [types.SimpleNamespace(priority=70)]
+                self.scheduler.enable_priority_scheduling = True
+                self.scheduler.request_lists = lambda: {
+                    **dict.fromkeys(ListKind, ()),
+                    ListKind.WAITING: waiting,
+                }
+                self.scheduler.running_batch.reqs = [
+                    types.SimpleNamespace(priority=p) for p in (-12, 30)
+                ]
+                reporter = SchedulerMetricsReporter(
+                    scheduler=self.scheduler,
+                    metrics_collector_context=SchedulerMetricsCollectorContext(
+                        enable_metrics=True,
+                        is_stats_logging_rank=True,
+                        current_scheduler_metrics_enabled=True,
+                        enable_kv_cache_events=False,
+                        collector=collector,
+                    ),
+                    metrics_collector=collector,
+                )
+                reporter.observe_priority_preemption(70, 0)
+                for _ in range(2):
+                    with patch(
+                        "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                        return_value=collector.last_log_time + 31,
+                    ):
+                        reporter._maybe_log_idle_metrics()
+                    self.assertEqual(
+                        registry.get_sample_value(
+                            "sglang:preemptions_total",
+                            {
+                                **base_labels,
+                                "victim_tier": "P3_Batch",
+                                "trigger_tier": "P0_Critical",
+                            },
+                        ),
+                        1,
+                    )
+                    self.assertEqual(
+                        registry.get_sample_value(
+                            "sglang:lowest_running_priority_value",
+                            base_labels,
+                        ),
+                        30 if low_first else -12,
+                    )
+                    self.assertEqual(
+                        registry.get_sample_value(
+                            "sglang:num_requests_waiting_by_tier",
+                            {**base_labels, "tier": "P3_Batch"},
+                        ),
+                        1,
+                    )
+                self.scheduler.running_batch.reqs.clear()
+                waiting.clear()
+                reporter._maybe_log_idle_metrics()
+                for name in (
+                    "sglang:num_requests_running_by_tier",
+                    "sglang:num_requests_waiting_by_tier",
+                    "sglang:lowest_running_priority_value",
+                ):
+                    samples = [
+                        s
+                        for family in registry.collect()
+                        for s in family.samples
+                        if s.name == name
+                    ]
+                    self.assertTrue(samples)
+                    self.assertTrue(all(s.value == 0 for s in samples))
+                quiet_reporter = SchedulerMetricsReporter(
+                    scheduler=self.scheduler,
+                    metrics_collector_context=SchedulerMetricsCollectorContext(
+                        enable_metrics=True,
+                        is_stats_logging_rank=False,
+                        current_scheduler_metrics_enabled=False,
+                        enable_kv_cache_events=False,
+                        collector=collector,
+                    ),
+                    metrics_collector=collector,
+                )
+                quiet_reporter.observe_priority_preemption(0, 70)
+                self.assertIsNone(
+                    registry.get_sample_value(
+                        "sglang:preemptions_total",
+                        {
+                            **base_labels,
+                            "victim_tier": "P0_Critical",
+                            "trigger_tier": "P3_Batch",
+                        },
+                    )
+                )
 
     def test_idle_publishes_refreshed_kv_metrics(self):
         self.reporter.current_scheduler_metrics_enabled = True

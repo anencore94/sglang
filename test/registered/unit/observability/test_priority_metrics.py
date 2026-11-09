@@ -26,6 +26,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     TokenizerMetricsCollector,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -58,22 +59,9 @@ def _collectors(registry, *, enabled=True, low_first=False):
                 )
             )
         stack.enter_context(
-            patch(
-                "sglang.srt.observability.metrics_collector.get_schedule",
-                return_value=SimpleNamespace(
-                    schedule_low_priority_values_first=low_first,
-                    prefill_delayer_max_delay_passes=10,
-                    prefill_delayer_forward_passes_buckets=None,
-                    prefill_delayer_wait_seconds_buckets=None,
-                ),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "sglang.srt.observability.metrics_collector.get_observability",
-                return_value=SimpleNamespace(
-                    prompt_tokens_buckets=None, generation_tokens_buckets=None
-                ),
+            get_context().override_server_args(
+                enable_priority_scheduling=enabled,
+                schedule_low_priority_values_first=low_first,
             )
         )
         return (

@@ -10,8 +10,11 @@ maybe_stub_sgl_kernel()
 
 import argparse
 import unittest
+from functools import partial
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import prometheus_client as prom
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.background import BackgroundTask
@@ -23,6 +26,12 @@ from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.environ import envs
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.label_transform import PRIORITY_TIERS
+from sglang.srt.observability.metrics_collector import (
+    QueueCount,
+    SchedulerMetricsCollector,
+    SchedulerStats,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_schedule,
@@ -330,6 +339,99 @@ class TestPriorityHeaders(CustomTestCase):
                 allow_header_priority=parsed.allow_header_priority
             ):
                 self.assertIs(get_serving().allow_header_priority, expected)
+
+    def test_http_priorities_reach_bounded_queue_metrics_without_remapping(self):
+        """Ingress integers stay intact while repeated exported snapshots reset tiers."""
+        for mode in (False, True):
+            for allow in (None, False, True):
+                for low_first in (False, True):
+                    with (
+                        self.subTest(mode=mode, allow=allow, low_first=low_first),
+                        get_context().override_server_args(
+                            enable_priority_scheduling=mode,
+                            allow_header_priority=allow,
+                            schedule_low_priority_values_first=low_first,
+                            default_priority_value=37,
+                        ),
+                    ):
+                        registry = prom.CollectorRegistry()
+                        base_labels = {"model_name": "test", "moe_ep_rank": "1"}
+                        labels = dict(base_labels)
+                        if mode:
+                            labels["priority"] = ""
+                        with patch.multiple(
+                            prom,
+                            **{
+                                name: partial(getattr(prom, name), registry=registry)
+                                for name in ("Gauge", "Counter", "Histogram", "Summary")
+                            },
+                        ):
+                            collector = SchedulerMetricsCollector(
+                                labels=labels, server_args=self.engine.server_args
+                            )
+                        for path in _PATHS:
+                            start = len(self.engine.requests)
+                            self._assert_priority(
+                                path, 0, {"X-Priority": "9"}, priority=0
+                            )
+                            enabled = mode and allow is not False
+                            fallback = 37 if mode else None
+                            self._assert_priority(
+                                path, 70 if enabled else fallback, {"Priority": "u=7"}
+                            )
+                            self._assert_priority(
+                                path,
+                                -12 if enabled else fallback,
+                                {"X-Priority": "-12"},
+                            )
+                            self._assert_priority(path, fallback)
+                            reqs = self.engine.requests[start:]
+                            raw_priorities = [r.priority for r in reqs]
+                            count = QueueCount.from_reqs(reqs, mode)
+                            stats = SchedulerStats(
+                                num_running_reqs=count, num_queue_reqs=count
+                            )
+                            for _ in range(2):
+                                collector.log_stats(stats)
+                                self.assertEqual(
+                                    registry.get_sample_value(
+                                        "sglang:num_running_reqs", labels
+                                    ),
+                                    4,
+                                )
+                            if mode:
+                                expected = (2, 0, 1, 1) if enabled else (1, 0, 3, 0)
+                                for tier, value in zip(PRIORITY_TIERS, expected):
+                                    self.assertEqual(
+                                        registry.get_sample_value(
+                                            "sglang:num_requests_running_by_tier",
+                                            {**base_labels, "tier": tier},
+                                        ),
+                                        value,
+                                    )
+                                self.assertEqual(
+                                    registry.get_sample_value(
+                                        "sglang:lowest_running_priority_value",
+                                        base_labels,
+                                    ),
+                                    (70 if low_first else -12)
+                                    if enabled
+                                    else (37 if low_first else 0),
+                                )
+                            self.assertEqual([r.priority for r in reqs], raw_priorities)
+                            collector.log_stats(SchedulerStats())
+                            for family in registry.collect():
+                                for sample in family.samples:
+                                    if "tier" in sample.labels:
+                                        self.assertIn(
+                                            sample.labels["tier"], PRIORITY_TIERS
+                                        )
+                                        self.assertEqual(sample.value, 0)
+                                    if "priority" in sample.labels:
+                                        self.assertIn(
+                                            sample.labels["priority"],
+                                            ("", *PRIORITY_TIERS),
+                                        )
 
 
 if __name__ == "__main__":
