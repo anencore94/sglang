@@ -4483,6 +4483,7 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
+            on_priority_preemption=self.metrics_reporter.observe_priority_preemption,
         )
 
         if self.chunked_req is not None:

@@ -591,6 +591,32 @@ class TestPrefillAdder(CustomTestCase):
             req.cache_request_handle, fulfilled_tokens=0, reason=None
         )
 
+    def test_priority_preemption_hook_reports_only_committed_victims(self):
+        self.scheduling_order(schedule_low_priority_values_first=True)
+        running = self.create_mock_req("victim", priority=50, max_new_tokens=100)
+        batch = self.create_running_batch([running])
+        events = []
+
+        def observe(victim, trigger):
+            # Notification comes after the resource release, not during selection.
+            self.assertEqual(batch.release_req.call_count, len(events) + 1)
+            events.append((victim, trigger))
+
+        adder = self.create_adder(batch, on_priority_preemption=observe)
+        self.mock_token_allocator.full_available_size.return_value = 100
+        self.mock_token_allocator.available_size.return_value = 100
+        too_large = self.create_mock_req("cannot-fit", priority=0, max_new_tokens=101)
+        self.assertFalse(adder.preempt_to_schedule(too_large))
+        self.assertEqual(events, [])
+        trigger = self.create_mock_req("trigger", priority=0, max_new_tokens=99)
+        self.assertTrue(adder.preempt_to_schedule(trigger))
+        self.assertEqual(events, [(50, 0)])
+        self.assertEqual(adder.preempt_list, [running])
+        self.assertEqual(adder.memory_budget.total_offset, 0)
+        # Even if filtering has not removed the old batch entry yet, don't count it again.
+        self.assertFalse(adder.preempt_to_schedule(trigger))
+        self.assertEqual(events, [(50, 0)])
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),

@@ -19,14 +19,14 @@ import dataclasses
 import logging
 import os
 import time
-from collections import Counter
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Union
 
 import msgspec
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.observability.label_transform import PRIORITY_TIERS, transform_priority
 from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_CATEGORIES,
     FORWARD_OVERLAP_NONE,
@@ -58,22 +58,66 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class QueueCount:
-    """Holds both the total count and optional per-priority breakdown for a queue."""
+    """Queue totals and bounded priority statistics, also used by external loggers."""
 
     total: int = 0
+    # Accepted for older producers; never populated by from_reqs.
     by_priority: Optional[Dict[int, int]] = None
+    by_tier: Optional[Dict[str, int]] = None
+    min_priority: Optional[int] = None
+    max_priority: Optional[int] = None
 
     @classmethod
-    def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
-        # NOTE: If requests have priority=None (no --default-priority-value set),
-        # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
-        # Set --default-priority-value when enabling priority scheduling to avoid this.
-        by_priority = (
-            dict(Counter(req.priority for req in reqs))
-            if enable_priority_scheduling
-            else None
+    def from_reqs(
+        cls,
+        reqs: List[Req],
+        enable_priority_scheduling: bool = False,
+    ):
+        if not enable_priority_scheduling:
+            return cls(total=len(reqs))
+        by_tier = dict.fromkeys(PRIORITY_TIERS, 0)
+        min_priority = max_priority = None
+        for req in reqs:
+            priority = req.priority
+            by_tier[transform_priority(priority)] += 1
+            if priority is not None:
+                min_priority = (
+                    priority if min_priority is None else min(min_priority, priority)
+                )
+                max_priority = (
+                    priority if max_priority is None else max(max_priority, priority)
+                )
+        return cls(
+            total=len(reqs),
+            by_tier=by_tier,
+            min_priority=min_priority,
+            max_priority=max_priority,
         )
-        return cls(total=len(reqs), by_priority=by_priority)
+
+    def tier_counts(self) -> Dict[str, int]:
+        counts = dict.fromkeys(PRIORITY_TIERS, 0)
+        if self.by_tier is not None:
+            for tier in PRIORITY_TIERS:
+                counts[tier] = self.by_tier.get(tier, 0)
+        elif self.by_priority is not None:
+            for priority, count in self.by_priority.items():
+                counts[transform_priority(priority)] += count
+        return counts
+
+    def worst_priority(self, schedule_low_priority_values_first: bool) -> Optional[int]:
+        worst = (
+            self.max_priority
+            if schedule_low_priority_values_first
+            else self.min_priority
+        )
+        if worst is None and self.by_priority:
+            priorities = (
+                p for p in self.by_priority if p is not None and self.by_priority[p]
+            )
+            worst = (max if schedule_low_priority_values_first else min)(
+                priorities, default=None
+            )
+        return worst
 
 
 @dataclass
@@ -365,11 +409,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         Summary = self._summary_cls or _PromSummary
 
         self.labels = labels
+        self._priority_labels = {k: v for k, v in labels.items() if k != "priority"}
+        self.schedule_low_priority_values_first = (
+            get_schedule().schedule_low_priority_values_first
+            if "priority" in labels
+            else False
+        )
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
-        self._known_priorities: Set[int] = set()
         # Window pool series carry the window's name (`window_<length>`); a
         # custom label of that name is overridden on them (`_log_window_gauge`).
         window_labelnames = [name for name in labels if name != "window"] + ["window"]
@@ -388,6 +437,37 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of requests in the waiting queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        tier_labelnames = [name for name in self._priority_labels if name != "tier"] + [
+            "tier"
+        ]
+        self.num_requests_running_by_tier = Gauge(
+            name="sglang:num_requests_running_by_tier",
+            documentation="Running requests by fixed numeric priority tier.",
+            labelnames=tier_labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.num_requests_waiting_by_tier = Gauge(
+            name="sglang:num_requests_waiting_by_tier",
+            documentation="Waiting requests by fixed numeric priority tier.",
+            labelnames=tier_labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.lowest_running_priority_value = Gauge(
+            name="sglang:lowest_running_priority_value",
+            documentation="Worst running raw priority in scheduling order; zero when empty or unknown.",
+            labelnames=self._priority_labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        preemption_labelnames = [
+            name
+            for name in self._priority_labels
+            if name not in ("victim_tier", "trigger_tier")
+        ] + ["victim_tier", "trigger_tier"]
+        self.priority_preemptions = Counter(
+            name="sglang:preemptions_total",
+            documentation="Committed priority preemptions with an attributable trigger.",
+            labelnames=preemption_labelnames,
         )
         self.num_grammar_queue_reqs = Gauge(
             name="sglang:num_grammar_queue_reqs",
@@ -1479,18 +1559,31 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             gauge.labels(**labels).set(value)
 
     def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
-        # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
-        # NOTE: When priority scheduling is enabled, the total is recorded under
-        # priority="" (the default label value). Per-priority breakdowns are recorded
-        # with priority="<int>". Grafana queries should use priority="" for totals.
         gauge.labels(**self.labels).set(data.total)
-        if data.by_priority is not None:
-            self._known_priorities.update(data.by_priority.keys())
-            for priority in self._known_priorities:
-                value = data.by_priority.get(priority, 0)
+        if "priority" in self.labels:
+            # Keep the total at priority=""; replace arbitrary integer labels.
+            for tier, value in data.tier_counts().items():
                 labels = dict(self.labels)
-                labels["priority"] = str(priority)
+                labels["priority"] = tier
                 gauge.labels(**labels).set(value)
+
+    def _log_tier_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
+        for tier, value in data.tier_counts().items():
+            labels = {**self._priority_labels, "tier": tier}
+            gauge.labels(**labels).set(value)
+
+    def increment_priority_preemption(
+        self, victim_priority: Optional[int], trigger_priority: Optional[int]
+    ) -> None:
+        # Memory retractions have no trigger and must not acquire a guessed pair.
+        if victim_priority is None or trigger_priority is None:
+            return
+        labels = {
+            **self._priority_labels,
+            "victim_tier": transform_priority(victim_priority),
+            "trigger_tier": transform_priority(trigger_priority),
+        }
+        self.priority_preemptions.labels(**labels).inc()
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
@@ -1714,6 +1807,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Basics
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
+        if "priority" in self.labels:
+            self._log_tier_queue_count(
+                self.num_requests_running_by_tier, stats.num_running_reqs
+            )
+            self._log_tier_queue_count(
+                self.num_requests_waiting_by_tier, stats.num_queue_reqs
+            )
+            worst_priority = stats.num_running_reqs.worst_priority(
+                self.schedule_low_priority_values_first
+            )
+            self.lowest_running_priority_value.labels(**self._priority_labels).set(
+                worst_priority if worst_priority is not None else 0
+            )
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
@@ -1884,8 +1990,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
 
 def tokenizer_metric_labels() -> Dict[str, str]:
-    """The labels on every ``TokenizerMetricsCollector`` metric. The priority
-    and custom labels start empty; each request fills them in."""
+    """Base labels; each request fills in its bounded priority tier and custom labels."""
     labels = {
         "model_name": get_serving().served_model_name,
         "engine_type": DisaggregationMode.to_engine_type(
@@ -1902,6 +2007,16 @@ def tokenizer_metric_labels() -> Dict[str, str]:
 
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
+    @staticmethod
+    def _bounded_priority_labels(labels: Dict[str, str]) -> Dict[str, str]:
+        if "priority" not in labels or labels["priority"] in PRIORITY_TIERS:
+            return labels
+        try:
+            priority = int(labels["priority"])
+        except (ValueError, TypeError):
+            priority = None
+        return {**labels, "priority": transform_priority(priority)}
+
     def __init__(
         self,
         server_args: Optional[ServerArgs] = None,
@@ -2184,6 +2299,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         is_streaming: bool = False,
         time_per_output_token: Optional[float] = None,
     ):
+        labels = self._bounded_priority_labels(labels)
         stream_labels = {
             **labels,
             "is_streaming": "true" if is_streaming else "false",
@@ -2236,6 +2352,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def observe_time_to_first_token(
         self, labels: Dict[str, str], value: float, *, stream: bool
     ):
+        labels = self._bounded_priority_labels(labels)
         self.histogram_time_to_first_token.labels(
             **labels, is_streaming="true" if stream else "false"
         ).observe(value)
@@ -2245,6 +2362,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
     ):
         if num_new_tokens <= 0:
             return
+        labels = self._bounded_priority_labels(labels)
         adjusted_interval = internval / num_new_tokens
         his = self.histogram_inter_token_latency.labels(**labels)
 
@@ -2265,6 +2383,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 break
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
+        labels = self._bounded_priority_labels(labels)
         self.num_aborted_requests_total.labels(**labels).inc(1)
 
 

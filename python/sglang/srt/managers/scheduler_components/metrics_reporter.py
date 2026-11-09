@@ -234,6 +234,14 @@ class SchedulerMetricsReporter:
     num_retracted_reqs: int = 0
     num_paused_reqs: int = 0
 
+    def observe_priority_preemption(
+        self, victim_priority: Optional[int], trigger_priority: Optional[int]
+    ) -> None:
+        if self.current_scheduler_metrics_enabled:
+            self.metrics_collector.increment_priority_preemption(
+                victim_priority, trigger_priority
+            )
+
     def __post_init__(self) -> None:
         self.enable_metrics = self.metrics_collector_context.enable_metrics
         self.is_stats_logging_rank = (
