@@ -277,6 +277,7 @@ class SchedulerDllmMixin:
             prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
             request_retirer=self.request_retirer,
+            on_priority_preemption=self.metrics_reporter.observe_priority_preemption,
         )
 
     def _process_dllm_batches(

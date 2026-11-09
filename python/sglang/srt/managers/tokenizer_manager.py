@@ -151,6 +151,7 @@ from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.label_transform import transform_priority
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
     TokenizerMetricsCollector,
@@ -3416,8 +3417,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             labels.update(custom_labels)
         if self.enable_priority_scheduling:
             priority = getattr(state.obj, "priority", None)
-            if priority is not None:
-                labels["priority"] = str(priority)
+            labels["priority"] = transform_priority(priority)
         finish_type = (recv_obj.finished_reasons[i] or {}).get("type")
         if not state.ttft_observed:
             # PD prefill workers never observe TTFT, so they never reach ITL.

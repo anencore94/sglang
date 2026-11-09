@@ -1159,7 +1159,13 @@ class TestIdleMetrics(CustomTestCase):
                     return_value=collector.last_log_time + 31,
                 ):
                     self.reporter._maybe_log_idle_metrics()
-                for priority, expected in (("", 2), ("1", 1), ("2", 1)):
+                for priority, expected in (
+                    ("", 2),
+                    ("P0_Critical", 2),
+                    ("P1_High", 0),
+                    ("P2_Normal", 0),
+                    ("P3_Batch", 0),
+                ):
                     self.assertEqual(
                         registry.get_sample_value(
                             "sglang:num_decode_host_receive_queue_reqs",

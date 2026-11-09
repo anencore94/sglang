@@ -1,27 +1,18 @@
 from typing import Optional
 
-_PRIORITY_MIN = 0
-_PRIORITY_MAX = 31
-_LOW_PRIORITY_VALUE = "LOW"
-_HIGH_PRIORITY_VALUE = "HIGH"
+PRIORITY_TIERS = ("P0_Critical", "P1_High", "P2_Normal", "P3_Batch")
 
-UNKNOWN_PRIORITY_VALUE = "UNKNOWN"
+UNKNOWN_PRIORITY_VALUE = PRIORITY_TIERS[3]
 
 
 def transform_priority(priority: Optional[int]) -> str:
-    """Transform the priority to a string for metrics reporting.
-    Limit the range to prevent high cardinality issues.
-
-    Args:
-        priority: The priority to transform.
-    Returns:
-        The transformed priority.
-    """
+    """Classify raw values without changing scheduling order or direction."""
     if priority is None:
         return UNKNOWN_PRIORITY_VALUE
-    elif priority < _PRIORITY_MIN:
-        return _LOW_PRIORITY_VALUE
-    elif priority >= _PRIORITY_MAX:
-        return _HIGH_PRIORITY_VALUE
-    else:
-        return str(priority)
+    if priority < 10:
+        return PRIORITY_TIERS[0]
+    if priority < 30:
+        return PRIORITY_TIERS[1]
+    if priority < 50:
+        return PRIORITY_TIERS[2]
+    return PRIORITY_TIERS[3]

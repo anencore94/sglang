@@ -45,7 +45,17 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Union,
+)
 
 import torch
 
@@ -660,7 +670,11 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
         request_retirer: Optional[RequestRetirer] = None,
         kv_awaiting_transfer: bool = False,
+        on_priority_preemption: Optional[
+            Callable[[Optional[int], Optional[int]], None]
+        ] = None,
     ):
+        self.on_priority_preemption = on_priority_preemption
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
         # that grid costs the request every later donation, so keep it there.
@@ -1984,6 +1998,8 @@ class PrefillAdder:
                     len(self.running_batch.reqs) - release_counter,
                     self.request_retirer,
                 )
+                if self.on_priority_preemption is not None:
+                    self.on_priority_preemption(running_req.priority, req.priority)
             else:
                 keep_indices.append(i)
         self.running_batch.filter_batch(keep_indices=keep_indices)

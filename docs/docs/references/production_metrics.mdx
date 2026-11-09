@@ -115,6 +115,80 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
+## Priority observability
+
+With `--enable-metrics --enable-priority-scheduling`, priority labels use four
+fixed numeric tiers. These tiers classify metrics only: they do not validate,
+clamp, or change the request priority used by the scheduler.
+
+| Tier | Raw priority |
+| --- | --- |
+| `P0_Critical` | Below 10, including negative values |
+| `P1_High` | 10–29 |
+| `P2_Normal` | 30–49 |
+| `P3_Batch` | 50 and above, or `None` when no numeric value is available |
+
+SGLang normally resolves an omitted request priority to its existing configured
+default before scheduling. The `None` fallback above only describes observability
+when a request or an external stats producer has no numeric priority.
+Without `--default-priority-value`, scheduler admission replaces `None` with its
+existing worst-priority sentinel: `sys.maxsize` when lower values run first
+(`P3_Batch`), or `-sys.maxsize - 1` otherwise (`P0_Critical`). Tokenizer metrics
+can still see `None` before scheduler normalization and classify it as `P3_Batch`.
+Tier names describe numeric ranges, **not scheduling precedence**: SGLang's
+`--schedule-low-priority-values-first` setting controls whether lower or higher
+numbers run first. Metrics do not change that setting or remap values.
+
+| Metric | Meaning |
+| --- | --- |
+| `sglang:num_requests_running_by_tier{tier="..."}` | Requests in the sampled running batch, in each fixed tier. |
+| `sglang:num_requests_waiting_by_tier{tier="..."}` | Requests in the scheduler's waiting queue, excluding separately reported grammar and disaggregated transfer queues. |
+| `sglang:lowest_running_priority_value` | Worst **raw numeric** priority in the sampled running batch: maximum when lower values run first, minimum otherwise. Zero when empty or no numeric priority is known. |
+| `sglang:preemptions_total{victim_tier="...",trigger_tier="..."}` | Committed priority preemptions, counted once per released victim and attributed to the request that caused the preemption. At most 16 tier pairs per base label set. |
+
+All four queue tiers are published on each stats update, including zeros for tiers
+that disappeared or an empty queue. The worst-priority gauge also resets to zero;
+use the running queue gauges to distinguish this sentinel from a real priority of
+zero. Request priorities are never metric label values. The raw worst value is a
+gauge sample, not a label.
+
+### Existing label compatibility
+
+Existing queue gauges (`sglang:num_running_reqs`, `sglang:num_queue_reqs`, and the
+prefill/decode disaggregation queue gauges) keep their total at `priority=""`.
+Their per-priority series now use the four tier strings instead of raw integers.
+Tokenizer request counters and latency/token histograms likewise use tier strings
+for the existing `priority` label. Update dashboards that match numeric priority
+labels. An empty base label on scheduler-wide metrics is not another tier.
+Without priority scheduling, the existing unlabeled-by-priority totals are
+unchanged and the new tier gauges are not populated.
+
+Custom stats loggers receive bounded `QueueCount.by_tier` counts and optional raw
+`min_priority`/`max_priority` values. `QueueCount.from_reqs` no longer builds a
+per-integer `by_priority` dictionary. That optional field remains accepted for
+older producers; the Prometheus collector buckets it before emitting any labels.
+
+The new preemption counter covers the existing priority-admission release path,
+including DLLM admission. It excludes unsuccessful attempts, requests already
+finished, memory-pressure decode retractions without a trigger, and missing
+numeric priorities. Existing `sglang:num_retracted_requests_total` and related
+generic retraction metrics remain unchanged; do not infer memory retractions from
+the victim/trigger counter.
+
+### Multiprocess and rank aggregation
+
+Tier and worst-value gauges use Prometheus multiprocess `mostrecent` aggregation,
+like existing queue gauges: one latest sample per full label set, not a sum of
+worker snapshots. They retain model and scheduler rank labels. Compare the worst
+value per scheduler; summing priorities across workers has no scheduling meaning.
+Counters sum process contributions within the same label set. Events follow the
+existing metrics-reporting rank gate. Normally only one attention TP/CP rank
+reports; if you enable metrics for all schedulers, select one TP/CP rank to avoid
+counting replicated evictions. Select the appropriate DP/PP/rank label sets when
+summing independent schedulers. These are sampled scheduler snapshots, not a
+global atomic queue view. Other configured custom labels can still affect
+cardinality.
+
 ## Request-level time per output token (TPOT)
 
 `sglang:request_time_per_output_token_seconds` records TPOT once per successfully finished request:
